@@ -36,6 +36,7 @@ _CPP_PUBLIC_NAMES = {
     "RangedReadSnapshot",
     "ObjectDataType",
     "SoftPinAction",
+    "ExistOptions",
     "ReplicateConfig",
     "ReplicaStatus",
     "MemoryDescriptor",
