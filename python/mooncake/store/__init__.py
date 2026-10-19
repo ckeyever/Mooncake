@@ -11,6 +11,7 @@ _CPP_EXPORTS = frozenset(
         "RangedReadSnapshot",
         "ObjectDataType",
         "SoftPinAction",
+        "ExistOptions",
         "ReplicateConfig",
         "ReplicaStatus",
         "MemoryDescriptor",

@@ -127,6 +127,11 @@ assert metadata.version("mooncake-transfer-engine") == {_project_version(project
 assert "administration" in metadata.metadata("mooncake-transfer-engine").get_all("Provides-Extra", [])
 assert mooncake.store._BACKEND == "cpp"
 assert mooncake.store.MooncakeDistributedStore is private_store.MooncakeDistributedStore
+assert mooncake.store.ExistOptions is private_store.ExistOptions
+options = mooncake.store.ExistOptions()
+assert options.prefetch_to_memory is False
+options.prefetch_to_memory = True
+assert options.prefetch_to_memory is True
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.RegisteredBufferPool is mooncake.store.RegisteredBufferPool
 from mooncake.buffer_pool import BufferPool, RegisteredBufferPool
