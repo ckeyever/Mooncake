@@ -1,5 +1,7 @@
 #pragma once
 
+#include "offload_restore_pipeline.h"
+
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
 #include <chrono>
@@ -855,6 +857,18 @@ class RealClient : public PyClient {
     batch_get_offload_object(const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
 
+    // Additive RPC; old peers keep serving the original TTL-based method.
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+    batch_get_offload_object_for_transfer(const std::vector<std::string> &keys,
+                                          const std::vector<int64_t> &sizes);
+
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+    batch_get_offload_object_impl(const std::vector<std::string> &keys,
+                                  const std::vector<int64_t> &sizes,
+                                  bool protected_buffer);
+
     /**
      * @brief Releases buffer associated with a specific batch_id.
      * Called by remote client after transfer completion.
@@ -898,7 +912,8 @@ class RealClient : public PyClient {
     // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
     // BatchGetLocal. Callers copy out of the restored arena (sequential
     // BatchGetOffloadObject or session BatchTransferReadOffloadRanges) while
-    // the returned lease is alive; the destructor releases the owner buffer.
+    // the returned lease is alive. Successful and unused leases release the
+    // owner buffer; an uncertain protected transfer retains its bounded quota.
     // allow_pinned: sequential memcpy may restore into the unregistered pinned
     // arena. Session scatter is TE-only, so it must pass false and land in the
     // owner's registered client buffer.
@@ -909,7 +924,12 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<int64_t> &restore_sizes,
         const std::unordered_map<std::string, std::vector<Slice>> &objects,
-        bool allow_pinned = true);
+        bool allow_pinned = true, bool protected_buffer = false);
+
+    tl::expected<void, ErrorCode> transfer_restored_offload_objects(
+        OffloadRestoreLease &lease, const std::vector<std::string> &keys,
+        const std::unordered_map<std::string, std::vector<Slice>> &objects,
+        const OffloadReadRange *read_range = nullptr);
 
     bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
@@ -1192,6 +1212,8 @@ class RealClient : public PyClient {
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
+    OffloadRestorePipelineConfig offload_restore_config_;
+    std::unique_ptr<OffloadRestorePipeline> offload_restore_pipeline_;
 
     // Dummy Client manage related members
     void dummy_client_monitor_func();
@@ -1335,6 +1357,7 @@ class RealClient : public PyClient {
         bool enable_embedded_master);
 
     friend class DirectGpuReadTest;
+    friend class OffloadRestoreIntegrationTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;

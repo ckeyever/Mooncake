@@ -4,6 +4,7 @@
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
+#include "offload_restore_pipeline.h"
 
 namespace mooncake {
 
@@ -73,6 +74,13 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
+    // Release-only buffers for pipelined reads: TTL GC never reuses them.
+    // Uncertain transfers retain their bounded quota until explicit release
+    // or owner shutdown.
+    tl::expected<BatchGetResult, ErrorCode> BatchGetForTransfer(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
@@ -112,6 +120,7 @@ class FileStorage {
 
    private:
     friend class FileStorageTest;
+    friend class OffloadRestoreIntegrationTest;
     friend class FileStoragePromotionTest;
     // TEST_F bodies are generated subclasses and do not inherit the fixture's
     // friendship, so the dangling-replica tests are friended by their
@@ -122,6 +131,8 @@ class FileStorage {
     friend class
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
     struct AllocatedBatch {
+        // Declared before handles so quota is returned after the memory.
+        std::shared_ptr<void> protected_reservation;
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
         std::unordered_map<std::string, Slice> slices;
@@ -216,6 +227,10 @@ class FileStorage {
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
         bool prefer_pinned);
 
+    tl::expected<BatchGetResult, ErrorCode> BatchGetInternal(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool protected_buffer);
+
     void ClientBufferGCThreadFunc();
 
     /**
@@ -238,6 +253,7 @@ class FileStorage {
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;
     std::atomic<uint64_t> next_batch_id_{1};
+    OffloadRestoreBudget protected_restore_budget_;
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;

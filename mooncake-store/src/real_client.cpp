@@ -589,21 +589,24 @@ class RealClient::OffloadRestoreLease {
         RealClient *owner, std::string endpoint, bool local_batch,
         std::optional<FileStorage::LocalBatchResult> local_owner,
         BatchGetOffloadObjectResponse response,
-        std::chrono::steady_clock::time_point start_time)
+        std::chrono::steady_clock::time_point start_time,
+        bool protected_buffer = false)
         : owner_(owner),
           endpoint_(std::move(endpoint)),
           local_batch_(local_batch),
           local_owner_(std::move(local_owner)),
           response_(std::move(response)),
-          start_time_(start_time) {}
+          start_time_(start_time),
+          protected_buffer_(protected_buffer) {}
 
     ~OffloadRestoreLease() {
-        if (owner_ == nullptr || local_batch_ ||
-            owner_->client_requester_ == nullptr) {
-            return;
+        if (owner_ == nullptr || !release_on_destroy_) return;
+        if (protected_buffer_ && local_batch_) {
+            owner_->file_storage_->ReleaseBuffer(response_.batch_id);
+        } else if (!local_batch_ && owner_->client_requester_) {
+            owner_->client_requester_->release_offload_buffer(
+                endpoint_, response_.batch_id, protected_buffer_);
         }
-        owner_->client_requester_->release_offload_buffer(endpoint_,
-                                                          response_.batch_id);
     }
 
     OffloadRestoreLease(const OffloadRestoreLease &) = delete;
@@ -611,7 +614,14 @@ class RealClient::OffloadRestoreLease {
     OffloadRestoreLease(OffloadRestoreLease &&) = delete;
     OffloadRestoreLease &operator=(OffloadRestoreLease &&) = delete;
 
-    bool local_batch() const { return local_batch_; }
+    OffloadBufferAccess buffer_access() const {
+        // Protected restores use the registered ordinary arena. Keep the
+        // existing Transfer Engine path, including when local memcpy is
+        // disabled. Only the unregistered pinned arena needs local addresses.
+        return local_batch_ && !protected_buffer_
+                   ? OffloadBufferAccess::kLocalAddress
+                   : OffloadBufferAccess::kTransferEngine;
+    }
     BatchGetOffloadObjectResponse &response() { return response_; }
     const BatchGetOffloadObjectResponse &response() const { return response_; }
 
@@ -623,8 +633,16 @@ class RealClient::OffloadRestoreLease {
     }
 
     bool LeaseExpired() const {
-        return !local_batch_ && ElapsedMs() >= response_.gc_ttl_ms;
+        return !protected_buffer_ && !local_batch_ &&
+               ElapsedMs() >= response_.gc_ttl_ms;
     }
+
+    void BeginTransfer() {
+        // A timeout is not proof that DMA stopped. Keep protected source
+        // memory quarantined on failure; the owner's quota bounds this.
+        if (protected_buffer_) release_on_destroy_ = false;
+    }
+    void TransferSucceeded() { release_on_destroy_ = true; }
 
    private:
     RealClient *owner_;
@@ -633,6 +651,8 @@ class RealClient::OffloadRestoreLease {
     std::optional<FileStorage::LocalBatchResult> local_owner_;
     BatchGetOffloadObjectResponse response_;
     std::chrono::steady_clock::time_point start_time_;
+    bool protected_buffer_;
+    bool release_on_destroy_ = true;
 };
 
 PyClient::~PyClient() {}
@@ -910,9 +930,16 @@ RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
     use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
+    offload_restore_config_ =
+        OffloadRestorePipelineConfig::FromEnvironment(Environ::Process());
+    if (offload_restore_config_.sub_batch_bytes != 0) {
+        offload_restore_pipeline_ = std::make_unique<OffloadRestorePipeline>(
+            offload_restore_config_.workers);
+    }
 }
 
 RealClient::~RealClient() {
+    offload_restore_pipeline_.reset();
     if (offload_rpc_server_) {
         offload_rpc_server_->stop();
         offload_rpc_server_.reset();
@@ -1462,6 +1489,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
+        offload_rpc_server_->register_handler<
+            &RealClient::batch_get_offload_object_for_transfer>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
         offload_rpc_server_->register_handler<&RealClient::verify_disk_replica>(
@@ -8694,6 +8723,19 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
+    return batch_get_offload_object_impl(keys, sizes, false);
+}
+
+async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+RealClient::batch_get_offload_object_for_transfer(
+    const std::vector<std::string> &keys, const std::vector<int64_t> &sizes) {
+    return batch_get_offload_object_impl(keys, sizes, true);
+}
+
+async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+RealClient::batch_get_offload_object_impl(const std::vector<std::string> &keys,
+                                          const std::vector<int64_t> &sizes,
+                                          bool protected_buffer) {
     // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
     // free to handle ping and other RPCs. Same heap-owned state pattern as
     // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
@@ -8701,14 +8743,22 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         std::vector<std::string> keys;
         std::vector<int64_t> sizes;
         std::shared_ptr<FileStorage> file_storage;
+        bool protected_buffer;
     };
     auto state = std::make_unique<CallState>();
     state->keys = keys;
     state->sizes = sizes;
     state->file_storage = file_storage_;
+    state->protected_buffer = protected_buffer;
+    if (!state->file_storage) {
+        co_return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto *s = state.get();
-    auto try_result = co_await coro_io::post(
-        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
+    auto try_result = co_await coro_io::post([s]() {
+        return s->protected_buffer
+                   ? s->file_storage->BatchGetForTransfer(s->keys, s->sizes)
+                   : s->file_storage->BatchGet(s->keys, s->sizes);
+    });
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
@@ -8718,7 +8768,7 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     co_return BatchGetOffloadObjectResponse(
         result.value().batch_id, std::move(result.value().pointers),
         client_->GetSegmentEndpoint(),
-        file_storage_->config_.client_buffer_gc_ttl_ms);
+        protected_buffer ? 0 : file_storage_->config_.client_buffer_gc_ttl_ms);
 }
 
 bool RealClient::release_offload_buffer(uint64_t batch_id) {
@@ -8896,15 +8946,17 @@ RealClient::restore_offload_objects(
     const std::vector<std::string> &keys,
     const std::vector<int64_t> &restore_sizes,
     const std::unordered_map<std::string, std::vector<Slice>> &objects,
-    bool allow_pinned) {
+    bool allow_pinned, bool protected_buffer) {
     if (keys.size() != restore_sizes.size()) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     const auto start_time = std::chrono::steady_clock::now();
     const bool local_batch =
-        allow_pinned &&
-        can_use_pinned_restore_arena(target_rpc_service_addr, objects);
+        protected_buffer
+            ? (file_storage_ && target_rpc_service_addr == local_rpc_addr)
+            : (allow_pinned &&
+               can_use_pinned_restore_arena(target_rpc_service_addr, objects));
 
     const TenantId tenant_id(client_->tenant_id());
     std::vector<std::string> storage_keys;
@@ -8917,8 +8969,20 @@ RealClient::restore_offload_objects(
     auto response =
         [&]() -> tl::expected<BatchGetOffloadObjectResponse, ErrorCode> {
         if (!local_batch) {
+            if (protected_buffer) {
+                return client_requester_->batch_get_offload_object_for_transfer(
+                    target_rpc_service_addr, storage_keys, restore_sizes);
+            }
             return client_requester_->batch_get_offload_object(
                 target_rpc_service_addr, storage_keys, restore_sizes);
+        }
+        if (protected_buffer) {
+            auto result =
+                file_storage_->BatchGetForTransfer(storage_keys, restore_sizes);
+            if (!result) return tl::unexpected(result.error());
+            return BatchGetOffloadObjectResponse(
+                result->batch_id, std::move(result->pointers),
+                client_->GetSegmentEndpoint(), 0);
         }
         auto result = file_storage_->BatchGetLocal(storage_keys, restore_sizes);
         if (!result) {
@@ -8937,7 +9001,7 @@ RealClient::restore_offload_objects(
 
     auto lease = std::make_unique<OffloadRestoreLease>(
         this, target_rpc_service_addr, local_batch, std::move(local_owner),
-        std::move(*response), start_time);
+        std::move(*response), start_time, protected_buffer);
     if (lease->response().pointers.size() != keys.size()) {
         LOG(ERROR) << "Pointer count mismatch from owner: expected="
                    << keys.size()
@@ -8981,12 +9045,78 @@ RealClient::batch_get_into_offload_object_internal(
         sizes.emplace_back(storage_size);
     }
 
+    if (!read_range && offload_restore_pipeline_) {
+        const auto ranges = PlanOffloadSubBatches(
+            sizes, offload_restore_config_.sub_batch_bytes,
+            offload_restore_config_.max_keys);
+        auto admission = ranges.size() > 1
+                             ? offload_restore_pipeline_->TryEnter()
+                             : std::shared_ptr<void>{};
+        if (admission) {
+            struct Batch {
+                std::vector<std::string> keys;
+                std::vector<int64_t> sizes;
+                std::unordered_map<std::string, std::vector<Slice>> objects;
+            };
+            std::vector<Batch> batches;
+            batches.reserve(ranges.size());
+            for (const auto &range : ranges) {
+                auto &batch = batches.emplace_back();
+                for (size_t i = range.begin; i < range.end; ++i) {
+                    batch.keys.push_back(keys[i]);
+                    batch.sizes.push_back(sizes[i]);
+                    batch.objects.emplace(keys[i], objects.at(keys[i]));
+                }
+            }
+            auto load = [&](const Batch &batch) {
+                return restore_offload_objects(target_rpc_service_addr,
+                                               batch.keys, batch.sizes,
+                                               batch.objects, false, true);
+            };
+            auto consume =
+                [&](const Batch &batch,
+                    tl::expected<std::unique_ptr<OffloadRestoreLease>,
+                                 ErrorCode>
+                        restored) -> tl::expected<void, ErrorCode> {
+                if (!restored &&
+                    (restored.error() == ErrorCode::BUFFER_OVERFLOW ||
+                     restored.error() == ErrorCode::RPC_FAIL ||
+                     restored.error() == ErrorCode::RPC_TIMEOUT)) {
+                    // Old owners and a full protected quota use an immediate
+                    // demand read; never prefetch an ordinary TTL buffer.
+                    restored = restore_offload_objects(target_rpc_service_addr,
+                                                       batch.keys, batch.sizes,
+                                                       batch.objects);
+                }
+                if (!restored) return tl::unexpected(restored.error());
+                return transfer_restored_offload_objects(**restored, batch.keys,
+                                                         batch.objects);
+            };
+            VLOG(1) << "Pipelined SSD restore: " << batches.size()
+                    << " sub-batches, endpoint=" << target_rpc_service_addr;
+            try {
+                return offload_restore_pipeline_->Run(
+                    batches, load, consume, tl::expected<void, ErrorCode>{});
+            } catch (const std::exception &e) {
+                LOG(ERROR) << "SSD restore pipeline failed: " << e.what();
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        }
+    }
+
     auto restored =
         restore_offload_objects(target_rpc_service_addr, keys, sizes, objects);
     if (!restored) {
         return tl::unexpected(restored.error());
     }
-    auto &lease = **restored;
+    return transfer_restored_offload_objects(**restored, keys, objects,
+                                             read_range);
+}
+
+tl::expected<void, ErrorCode> RealClient::transfer_restored_offload_objects(
+    OffloadRestoreLease &lease, const std::vector<std::string> &keys,
+    const std::unordered_map<std::string, std::vector<Slice>> &objects,
+    const OffloadReadRange *read_range) {
     if (read_range) {
         if (lease.response().pointers[0] >
             std::numeric_limits<uint64_t>::max() - read_range->source_offset) {
@@ -8994,15 +9124,14 @@ RealClient::batch_get_into_offload_object_internal(
         }
         lease.response().pointers[0] += read_range->source_offset;
     }
+    lease.BeginTransfer();
     auto result = client_->BatchGetOffloadObject(
         lease.response().transfer_engine_addr, keys, lease.response().pointers,
-        objects,
-        lease.local_batch() ? OffloadBufferAccess::kLocalAddress
-                            : OffloadBufferAccess::kTransferEngine);
+        objects, lease.buffer_access());
     const auto elapsed_time = lease.ElapsedMs();
     LOG(INFO) << "Time taken for batch_get_into_offload_object_internal: "
-              << elapsed_time
-              << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
+              << elapsed_time << "ms, with transfer_engine_addr: "
+              << lease.response().transfer_engine_addr
               << ", key size: " << objects.size()
               << ", batch_id: " << lease.response().batch_id
               << ", gc ttl: " << lease.response().gc_ttl_ms << "ms.";
@@ -9012,6 +9141,7 @@ RealClient::batch_get_into_offload_object_internal(
                    << result.error();
         return result;
     }
+    lease.TransferSucceeded();
     if (lease.LeaseExpired()) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
@@ -9079,6 +9209,14 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
     return result;
 }
 
+tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+ClientRequester::batch_get_offload_object_for_transfer(
+    const std::string &client_addr, const std::vector<std::string> &keys,
+    const std::vector<int64_t> &sizes) {
+    return invoke_rpc<&RealClient::batch_get_offload_object_for_transfer,
+                      BatchGetOffloadObjectResponse>(client_addr, keys, sizes);
+}
+
 tl::expected<VerifyDiskReplicaResponse, ErrorCode>
 ClientRequester::verify_disk_replica(const std::string &client_addr,
                                      const VerifyDiskReplicaRequest &request) {
@@ -9094,15 +9232,26 @@ ClientRequester::verify_disk_replica(const std::string &client_addr,
 
 void ClientRequester::release_offload_buffer(const std::string &client_addr,
                                              uint64_t batch_id) {
-    // Fire-and-forget: attempt to release buffer, log errors but don't block
+    release_offload_buffer(client_addr, batch_id, false);
+}
+
+void ClientRequester::release_offload_buffer(const std::string &client_addr,
+                                             uint64_t batch_id,
+                                             bool protected_buffer) {
     auto result = invoke_rpc<&RealClient::release_offload_buffer, bool>(
         client_addr, batch_id);
+    if (!result && protected_buffer) {
+        // A lost reply may mean the owner already released it. Repeating the
+        // idempotent release is safe and bounds retries during peer failure.
+        result = invoke_rpc<&RealClient::release_offload_buffer, bool>(
+            client_addr, batch_id);
+    }
     if (!result) {
-        // This is expected in some cases (e.g., network issues, buffer already
-        // GC'd) Log at INFO level since GC will eventually clean up anyway
+        // Ordinary buffers have TTL cleanup. Protected buffers stay in the
+        // bounded owner quota if explicit release cannot be confirmed.
         VLOG(1) << "Failed to release_offload_buffer for batch_id=" << batch_id
-                << " at " << client_addr
-                << " (will be GC'd): " << result.error();
+                << " at " << client_addr << ": " << result.error()
+                << " (protected restore buffers require explicit release)";
     } else {
         VLOG(1) << "Successfully released buffer for batch_id=" << batch_id
                 << " at " << client_addr;

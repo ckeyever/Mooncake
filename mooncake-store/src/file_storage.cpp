@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -48,7 +49,11 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
-          config.local_buffer_size, client ? client->GetProtocol() : "")) {
+          config.local_buffer_size, client ? client->GetProtocol() : "")),
+      protected_restore_budget_(std::min<uint64_t>(
+          64ULL << 20, static_cast<uint64_t>(
+                           std::max<int64_t>(0, config.local_buffer_size)) /
+                           2)) {
     if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
@@ -266,11 +271,56 @@ FileStorage::LoadBatch(const std::vector<std::string>& keys,
 
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    return BatchGetInternal(keys, sizes, false);
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode>
+FileStorage::BatchGetForTransfer(const std::vector<std::string>& keys,
+                                 const std::vector<int64_t>& sizes) {
+    return BatchGetInternal(keys, sizes, true);
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode>
+FileStorage::BatchGetInternal(const std::vector<std::string>& keys,
+                              const std::vector<int64_t>& sizes,
+                              bool protected_buffer) {
+    std::shared_ptr<void> reservation;
+    if (protected_buffer) {
+        if (keys.empty() || keys.size() != sizes.size()) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        uint64_t bytes = 0;
+        for (const auto size : sizes) {
+            if (size < 0 || size > config_.local_buffer_size) {
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            uint64_t allocation = std::max<uint64_t>(size, 1);
+            if (config_.use_uring) {
+                allocation =
+                    align_up(static_cast<uint64_t>(size), 4096) + 2 * 4096;
+            }
+            allocation =
+                client_buffer_allocator_
+                    ? client_buffer_allocator_->normalizedAllocationSize(
+                          allocation)
+                    : 0;
+            if (allocation == 0) {
+                return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
+            }
+            if (allocation > std::numeric_limits<uint64_t>::max() - bytes) {
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            bytes += allocation;
+        }
+        reservation = protected_restore_budget_.TryAcquire(bytes);
+        if (!reservation) return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
+    }
     auto start_time = std::chrono::steady_clock::now();
     auto load_result = LoadBatch(keys, sizes, false);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
     auto allocated_batch = std::move(load_result.value());
+    allocated_batch->protected_reservation = std::move(reservation);
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
 
@@ -1133,7 +1183,8 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                 auto gc_now = std::chrono::steady_clock::now();
                 for (auto it = client_buffer_allocated_batches_.begin();
                      it != client_buffer_allocated_batches_.end();) {
-                    if (gc_now >= it->second->lease_timeout) {
+                    if (!it->second->protected_reservation &&
+                        gc_now >= it->second->lease_timeout) {
                         it = client_buffer_allocated_batches_.erase(it);
                     } else {
                         ++it;
@@ -1175,7 +1226,8 @@ void FileStorage::ClientBufferGCThreadFunc() {
                 auto now = std::chrono::steady_clock::now();
                 for (auto it = client_buffer_allocated_batches_.begin();
                      it != client_buffer_allocated_batches_.end();) {
-                    if (now >= it->second->lease_timeout) {
+                    if (!it->second->protected_reservation &&
+                        now >= it->second->lease_timeout) {
                         VLOG(1) << "GC releasing batch_id: " << it->first
                                 << " (lease expired)";
                         it = client_buffer_allocated_batches_.erase(it);

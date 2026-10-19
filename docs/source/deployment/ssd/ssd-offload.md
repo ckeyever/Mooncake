@@ -173,6 +173,57 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=file_per_key_storage_b
 
 ---
 
+## Pipelined LOCAL_DISK restores
+
+Whole-object sub-batch pipelining is opt-in on the requesting Real Client.
+It overlaps loading the next sub-batch from SSD into the owner's registered
+DRAM arena with transferring the previous sub-batch into the final host or
+accelerator buffers. Existing Python APIs, including
+`batch_get_into_multi_buffers`, keep their synchronous completion semantics.
+
+| Requester environment variable | Default | Meaning |
+|---|---|---|
+| `MC_STORE_SSD_RESTORE_SUB_BATCH_BYTES` | `0` | Target payload bytes per sub-batch; `0` disables pipelining |
+| `MC_STORE_SSD_RESTORE_SUB_BATCH_KEYS` | `32` | Maximum complete objects per sub-batch; must be positive |
+| `MC_STORE_SSD_RESTORE_WORKERS` | `2` | Persistent loader workers and maximum admitted pipeline requests per Real Client; valid range `1` to `16` |
+
+For example, set these variables before creating the requesting client:
+
+```bash
+export MC_STORE_SSD_RESTORE_SUB_BATCH_BYTES=1048576
+export MC_STORE_SSD_RESTORE_SUB_BATCH_KEYS=32
+export MC_STORE_SSD_RESTORE_WORKERS=2
+```
+
+Each admitted request holds at most two sub-batches: the current transfer and
+one look-ahead load. Transfers remain on the calling thread to preserve its
+accelerator context. A single sub-batch, ranged reads, a request containing an
+object larger than the byte target, or exhausted requester admission uses the
+existing path. Objects are never split internally.
+
+The owner exposes an additive `batch_get_offload_object_for_transfer` RPC.
+Its staging buffers are released explicitly after transfer completion and are
+excluded from both periodic TTL GC and allocation-pressure GC. Protected
+allocations, including allocator rounding and direct-I/O padding, share a quota of
+`min(64 MiB, half the owner's normal staging arena)` across callers. The
+ordinary arena's capacity remains the hard allocation limit. If protected
+admission fails, or a peer does not serve the new RPC, that sub-batch uses an
+immediate ordinary demand read; an ordinary TTL buffer is never prefetched.
+
+If a transfer fails with uncertain completion, the source remains retained
+against this bounded quota. Unused look-ahead reads are drained and released.
+A failed explicit release is retried once. A requester crash or an
+unacknowledged release can retain protected quota until the owner is restarted;
+TTL expiry does not establish that DMA has stopped and therefore does not free
+these buffers. Quota exhaustion falls back to ordinary demand reads.
+
+This optimizes demand restores and does not create MEMORY replicas or trigger
+SSD-to-DRAM promotion. Small sub-batches add RPC overhead and can reduce NVMe
+queue depth; tune the byte/key targets against the existing path with the same
+I/O mode and workload. Single-object requests receive no intra-object
+pipelining benefit. The optional pinned restore arena and existing Ascend
+transport-mode constraints are unchanged.
+
 ## Storage Backends
 
 ### `bucket_storage_backend` (recommended)

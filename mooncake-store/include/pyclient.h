@@ -159,15 +159,22 @@ class ClientRequester {
                              const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
 
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object_for_transfer(const std::string &client_addr,
+                                          const std::vector<std::string> &keys,
+                                          const std::vector<int64_t> &sizes);
+
     /**
      * @brief Notifies remote FileStorage to release buffer after transfer
-     * completion. This is a fire-and-forget call - errors are logged but not
-     * propagated.
+     * completion. Errors are logged but not propagated; protected releases
+     * retry once because their buffers have no TTL cleanup.
      * @param client_addr Network address of the remote FileStorage service.
      * @param batch_id The batch_id returned from batch_get_offload_object.
      */
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
+    void release_offload_buffer(const std::string &client_addr,
+                                uint64_t batch_id, bool protected_buffer);
 
     /**
      * @brief Asks a replica owner to verify the backing file of each key and

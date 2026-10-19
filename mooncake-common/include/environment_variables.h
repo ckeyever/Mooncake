@@ -38,6 +38,12 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_USE_URING);
 };
 
+struct OffloadRestoreEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(uint64_t, MC_STORE_SSD_RESTORE_SUB_BATCH_BYTES);
+    MC_DEFINE_ENV_VAR(uint64_t, MC_STORE_SSD_RESTORE_SUB_BATCH_KEYS);
+    MC_DEFINE_ENV_VAR(uint64_t, MC_STORE_SSD_RESTORE_WORKERS);
+};
+
 struct FilePerKeyEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_FSDIR);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_ENABLE_EVICTION);

@@ -196,6 +196,55 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
 
+    void CheckProtectedRestoreLifetime() {
+        auto config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path;
+        config.storage_backend_type = StorageBackendType::kFilePerKey;
+        config.local_buffer_size = 64 * 1024;
+        config.use_uring = false;
+        FileStorage storage(config, nullptr, "localhost:9003");
+        ASSERT_TRUE(storage.storage_backend_->Init());
+
+        // Failed loads must return the reserved owner quota.
+        EXPECT_FALSE(storage.BatchGetForTransfer({"missing"}, {32 * 1024}));
+        EXPECT_EQ(storage.protected_restore_budget_.used(), 0u);
+
+        std::string payload(32 * 1024, 'p');
+        std::unordered_map<std::string, std::vector<Slice>> writes{
+            {"payload", {{payload.data(), payload.size()}}}};
+        ASSERT_TRUE(storage.storage_backend_->BatchOffload(writes, nullptr));
+        auto protected_read =
+            storage.BatchGetForTransfer({"payload"}, {32 * 1024});
+        ASSERT_TRUE(protected_read);
+        EXPECT_EQ(storage.protected_restore_budget_.used(), payload.size());
+        EXPECT_FALSE(storage.BatchGetForTransfer({"payload"}, {32 * 1024}));
+
+        // A protected read may not consume the rest of the ordinary arena.
+        auto ordinary = storage.BatchGet({"payload"}, {32 * 1024});
+        ASSERT_TRUE(ordinary);
+        {
+            MutexLocker lock(&storage.client_buffer_mutex_);
+            for (auto& [id, batch] : storage.client_buffer_allocated_batches_) {
+                batch->lease_timeout =
+                    std::chrono::steady_clock::time_point::min();
+            }
+        }
+        // Allocation pressure reclaims the ordinary expired read, but must
+        // leave the protected read intact despite its expired timestamp.
+        auto pressure =
+            FileStorageAllocateBatch(storage, {"pressure"}, {40 * 1024});
+        EXPECT_FALSE(pressure);
+        EXPECT_EQ(
+            std::string(reinterpret_cast<char*>(protected_read->pointers[0]),
+                        payload.size()),
+            payload);
+        EXPECT_TRUE(storage.ReleaseBuffer(protected_read->batch_id));
+        EXPECT_FALSE(storage.ReleaseBuffer(protected_read->batch_id));
+        EXPECT_EQ(storage.protected_restore_budget_.used(), 0u);
+        EXPECT_TRUE(
+            FileStorageAllocateBatch(storage, {"pressure"}, {40 * 1024}));
+    }
+
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
@@ -758,6 +807,10 @@ TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
     ASSERT_TRUE(enable_offloading);
     EXPECT_TRUE(*enable_offloading);
 #endif
+}
+
+TEST_F(FileStorageTest, ProtectedRestoreSurvivesExpiryUntilExplicitRelease) {
+    CheckProtectedRestoreLifetime();
 }
 
 TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {

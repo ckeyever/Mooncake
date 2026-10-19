@@ -52,6 +52,11 @@ class ClientBufferAllocator
 
     [[nodiscard]] std::optional<BufferHandle> allocate(size_t size);
 
+    // Actual arena bytes consumed by allocate(size), including bin rounding.
+    [[nodiscard]] uint64_t normalizedAllocationSize(size_t size) const {
+        return allocator_ ? allocator_->normalizedAllocationSize(size) : 0;
+    }
+
    protected:
     // Constructors accessible to derived classes
     ClientBufferAllocator(void* addr, size_t size, const std::string& protocol);
